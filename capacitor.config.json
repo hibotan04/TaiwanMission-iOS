@@ -1,0 +1,19 @@
+{
+  "appId": "com.tadaishireina.taiwanmission",
+  "appName": "台湾ミッション図鑑",
+  "webDir": "dist",
+  "ios": {
+    "contentInset": "never",
+    "preferredContentMode": "mobile",
+    "scrollEnabled": false
+  },
+  "plugins": {
+    "FirebaseAuthentication": {
+      "skipNativeAuth": false,
+      "providers": [
+        "apple.com",
+        "google.com"
+      ]
+    }
+  }
+}
