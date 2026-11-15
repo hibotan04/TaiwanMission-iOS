@@ -1,3 +1,4 @@
+import { removeCloudAccount } from "./removeCloudAccount";
 import { useState, useEffect, useRef } from "react";
 import { Capacitor } from "@capacitor/core";
 import { Share } from "@capacitor/share";
@@ -26,7 +27,7 @@ import {
   type User,
 } from "firebase/auth";
 import { deleteDoc, doc, getDoc, getFirestore, serverTimestamp, setDoc } from "firebase/firestore";
-import { deleteObject, getDownloadURL, getStorage, ref as storageRef, uploadString } from "firebase/storage";
+import { listAll, deleteObject, getDownloadURL, getStorage, ref as storageRef, uploadString } from "firebase/storage";
 import { motion, AnimatePresence, useMotionValue } from "motion/react";
 import { CheckCircle2, MapPin, Lightbulb, ChevronLeft, Camera, Upload, Lock, Map, BookOpen, Settings, Mail, LogOut, Trash2, AlertTriangle, FileText, MessageCircle, Sparkles, Cloud, Unlock, Gift, X, ShieldCheck, CreditCard, RefreshCw, BadgeCheck, ImagePlus, Eye, Share2 } from "lucide-react";
 import luroufanSticker from "@/imports/stickers/card-01-luroufan.png";
@@ -298,10 +299,8 @@ function getFirebaseServices() {
     auth = initializeAuth(app, {
       persistence: isNative ? inMemoryPersistence : indexedDBLocalPersistence,
     });
-    console.log(`[DEBUG] getFirebaseServices: Auth initialized with ${isNative ? "inMemoryPersistence" : "indexedDBLocalPersistence"}`);
   } catch {
     auth = getAuth(app);
-    console.log(`[DEBUG] getFirebaseServices: Auth already initialized, retrieved existing instance.`);
   }
   const db = getFirestore(app);
   const storage = getStorage(app);
@@ -552,20 +551,10 @@ async function loadCloudData(uid: string): Promise<CloudAppData | null> {
   return snap.exists() ? snap.data() as CloudAppData : null;
 }
 
-async function deleteCloudData(uid: string, photoIds: number[]) {
-  const { db, storage } = getFirebaseServices();
-  await Promise.allSettled([
-    deleteDoc(doc(db, "users", uid, "appData", "main")),
-    ...photoIds.map(id => deleteObject(storageRef(storage, `users/${uid}/mission-photos/${id}.jpg`))),
-  ]);
-}
-
 async function signInWithNativeOAuth(provider: "apple" | "google") {
-  console.log(`[DEBUG] signInWithNativeOAuth started for ${provider}`);
   const { auth } = getFirebaseServices();
 
   // GoogleのclientIdは capacitor.config.json の plugins.FirebaseAuthentication.google.clientId から読まれる
-  console.log(`[DEBUG] signInWithNativeOAuth: calling FirebaseAuthentication.signInWithGoogle/Apple...`);
   const result = provider === "google"
     ? await FirebaseAuthentication.signInWithGoogle({
         scopes: ["email", "profile"],
@@ -588,9 +577,7 @@ async function signInWithNativeOAuth(provider: "apple" | "google") {
         rawNonce: credential.nonce,
       });
 
-  console.log(`[DEBUG] signInWithNativeOAuth: signing in with Firebase credential...`);
   await signInWithCredential(auth, firebaseCredential);
-  console.log(`[DEBUG] signInWithNativeOAuth: Firebase sign-in completed successfully!`);
 }
 
 function authErrorMessage(error: unknown) {
@@ -2180,6 +2167,10 @@ export default function App() {
   const [cloudSyncStatus, setCloudSyncStatus] = useState<"idle" | "syncing" | "saved" | "error">("idle");
   const revenueCatConfiguredRef = useRef(false);
   const lastCloudSaveRef = useRef("");
+  const savingRef = useRef(new Set<Promise<unknown>>());
+  const pausedCloudUid = useRef<string | null>(null);
+  const deletingRef = useRef(false);
+  const [deletingAccount, setDeletingAccount] = useState(false);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -2215,14 +2206,15 @@ export default function App() {
     }
     const { auth } = getFirebaseServices();
     setPersistence(auth, browserLocalPersistence).catch(error => {
-      console.warn("Firebase persistence could not be enabled.", error);
+      console.warn("Firebase persistence could not be enabled.");
     });
     if (!Capacitor.isNativePlatform()) {
       getRedirectResult(auth).catch(error => {
-        console.warn("Firebase redirect login could not be completed.", error);
+        console.warn("Firebase redirect login could not be completed.");
       });
     }
     return onAuthStateChanged(auth, user => {
+      if (!user) pausedCloudUid.current = null;
       setFirebaseUser(user);
       setAuthReady(true);
       if (!user) return;
@@ -2327,7 +2319,7 @@ export default function App() {
       setCloudSyncStatus("syncing");
       try {
         const data = await loadCloudData(firebaseUser.uid);
-        if (cancelled) return;
+        if (cancelled || pausedCloudUid.current === firebaseUser.uid) return;
         if (data) {
           setAchieved(prev => new Set([...Array.from(prev), ...(data.achieved ?? [])]));
           setPhotos(prev => ({ ...normalizeRecordKeys(data.photos), ...prev }));
@@ -2336,7 +2328,7 @@ export default function App() {
         }
         setCloudSyncStatus("saved");
       } catch (error) {
-        console.warn("Cloud data could not be restored.", error);
+        console.warn("Cloud data could not be restored.");
         setCloudSyncStatus("error");
       } finally {
         if (!cancelled) setCloudReady(true);
@@ -2358,9 +2350,13 @@ export default function App() {
     if (snapshot === lastCloudSaveRef.current) return;
 
     const timer = window.setTimeout(async () => {
+      if (pausedCloudUid.current === firebaseUser.uid) return;
       setCloudSyncStatus("syncing");
+      const save = saveCloudData(firebaseUser.uid, { achieved, photos, memos, stickerPositions });
+      savingRef.current.add(save);
       try {
-        const cloudPhotos = await saveCloudData(firebaseUser.uid, { achieved, photos, memos, stickerPositions });
+        const cloudPhotos = await save;
+        if (pausedCloudUid.current === firebaseUser.uid) return;
         setPhotos(prev => ({ ...prev, ...cloudPhotos }));
         lastCloudSaveRef.current = JSON.stringify({
           achieved: Array.from(achieved).sort((a, b) => a - b),
@@ -2370,8 +2366,10 @@ export default function App() {
         });
         setCloudSyncStatus("saved");
       } catch (error) {
-        console.warn("Cloud data could not be saved.", error);
+        console.warn("Cloud data could not be saved.");
         setCloudSyncStatus("error");
+      } finally {
+        savingRef.current.delete(save);
       }
     }, 900);
 
@@ -2390,7 +2388,7 @@ export default function App() {
           unlockPremium();
         }
       } catch (error) {
-        console.warn("RevenueCat could not be initialized yet.", error);
+        console.warn("RevenueCat could not be initialized yet.");
       }
     };
     refreshPremiumStatus();
@@ -2480,14 +2478,12 @@ export default function App() {
   const handleOAuth = async (provider: "apple" | "google") => {
     try {
       const isNative = Capacitor.isNativePlatform();
-      console.log(`[DEBUG] handleOAuth: provider=${provider}, isNative=${isNative}`);
       
       const { auth } = getFirebaseServices();
       const authProvider = provider === "google"
         ? new GoogleAuthProvider()
         : new OAuthProvider("apple.com");
       
-      console.log(`[DEBUG] handleOAuth: authProvider created.`);
       authProvider.addScope("email");
       if (provider === "google") {
         authProvider.addScope("profile");
@@ -2498,15 +2494,12 @@ export default function App() {
       }
 
       if (isNative) {
-        console.log(`[DEBUG] handleOAuth: calling signInWithNativeOAuth...`);
         await signInWithNativeOAuth(provider);
       } else {
-        console.log(`[DEBUG] Non-native platform detected! Calling signInWithPopup...`);
         await setPersistence(auth, browserLocalPersistence);
         await signInWithPopup(auth, authProvider);
       }
     } catch (error) {
-      console.error(`[DEBUG] handleOAuth error:`, error);
       throw new Error(error instanceof Error ? error.message : authErrorMessage(error));
     }
   };
@@ -2538,7 +2531,7 @@ export default function App() {
       const { auth } = getFirebaseServices();
       await signOut(auth);
     } catch (error) {
-      console.warn("Firebase sign-out failed.", error);
+      console.warn("Firebase sign-out failed.");
     }
     try {
       ["tw_loggedin", "tw_auth", "tw_a_v5", "tw_p_v5", "tw_m_v5", "tw_sp_v5", "tw_premium"].forEach(k => localStorage.removeItem(k));
@@ -2555,15 +2548,44 @@ export default function App() {
     setScreen("login");
   };
   const handleDeleteAccount = async () => {
+    if (deletingRef.current) return;
     const user = firebaseUser;
-    if (user) {
-      try {
-        await deleteCloudData(user.uid, Object.keys(photos).map(Number));
-        await deleteUser(user);
-      } catch (error) {
-        console.warn("Firebase account deletion failed.", error);
-      }
+    if (!user) {
+      window.alert("ログイン状態を確認できません。再度ログインしてから削除してください。");
+      return;
     }
+    deletingRef.current = true;
+    setDeletingAccount(true);
+    let cleanupStarted = false;
+    try {
+      const { auth, db, storage } = getFirebaseServices();
+      if (auth.currentUser?.uid !== user.uid) throw new Error("auth/requires-recent-login");
+      const token = await user.getIdTokenResult();
+      if (Date.now() - new Date(token.authTime).getTime() >= 4 * 60 * 1000) {
+        throw new Error("auth/requires-recent-login");
+      }
+      pausedCloudUid.current = user.uid;
+      cleanupStarted = true;
+      await Promise.allSettled([...savingRef.current]);
+      const folder = storageRef(storage, `users/${user.uid}/mission-photos`);
+      await removeCloudAccount({
+        listPhotos: async () => (await listAll(folder)).items,
+        deletePhoto: deleteObject,
+        deleteDocument: () => deleteDoc(doc(db, "users", user.uid, "appData", "main")),
+        deleteAccount: () => deleteUser(user),
+      });
+    } catch (error) {
+      if (!cleanupStarted || (error as { code?: string })?.code === "auth/requires-recent-login") {
+        window.alert("アカウントの削除は完了していません。再度ログインしてから削除してください。");
+      } else {
+        window.alert("削除は完了していません。一部のクラウドデータがすでに削除された可能性があります。同期を一時停止しました。通信状態を確認してもう一度「アカウントを削除」を実行してください。");
+      }
+      return;
+    } finally {
+      deletingRef.current = false;
+      setDeletingAccount(false);
+    }
+    setStorageReady(false);
     try {
       ["tw_loggedin","tw_auth","tw_a_v5","tw_p_v5","tw_m_v5","tw_sp_v5","tw_premium"].forEach(k => localStorage.removeItem(k));
     } catch {}
@@ -2582,6 +2604,7 @@ export default function App() {
     setIsPremium(false);
   };
 
+  if (deletingAccount) return <AppShell><p role="status" className="p-6">アカウントとクラウドデータを削除しています…</p></AppShell>;
   if (screen === "loading") return <LoadingScreen/>;
   if (screen === "login") return <LoginScreen onLogin={handleLogin} onEmailAuth={handleEmailAuth} onOAuth={handleOAuth}/>;
 
